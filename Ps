@@ -1,804 +1,477 @@
---[[
-	Auto Restock Rak (Kios) - Pasar Hutan
-	Mengisi setiap slot rak kios kamu secara otomatis dari bahan di tas.
-
-	Cara kerja (mengikuti mekanik asli game):
-	- Pegang bahan di tangan, dekati slot rak (<= 6 stud), lalu tekan E.
-	- Ini disimulasikan dengan fireproximityprompt(prompt).
-	- Kalau slot sudah PENUH, game tidak menambah apa-apa (aman, tidak rugikan).
-	- Slot kosong diisi dengan bahan yang dicentang di UI.
-
-	Butuh executor yang menyediakan fireproximityprompt (Delta, Synapse, dll).
-]]
+-- ==========================================
+-- RAK MANAGER & SMART AUTO LOOT (V15)
+-- FIX BUG DETEKSI SPAWN (SMART VISIBILITY CHECK)
+-- ==========================================
 
 local Players = game:GetService("Players")
-local PlayerGui
-local player = Players.LocalPlayer
-local firePrompt = (getgenv and getgenv().fireproximityprompt) or rawget(_G, "fireproximityprompt")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
 
-PlayerGui = player:WaitForChild("PlayerGui", 10)
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- ===================== KONFIGURASI =====================
-local CFG = {
-	interval    = 10,    -- detik antar siklus
-	settle      = 0.35,  -- jeda setelah tiba di slot
-	actionWait  = 0.75,  -- jeda setelah menekan prompt
-	movePlayer  = true,  -- pindahkan karakter ke slot
-	fillEmpty   = true,  -- isi slot kosong
-	topUp       = true,  -- top up slot yang sudah berisi
-	refreshList = 4,     -- refresh daftar bahan setiap N siklus
-	maxLog      = 6,
-}
+-- State Restock
+local selectedSlot, selectedItem = "slot1", ""
+local autoRestockAll, autoRestockSelected = false, false
+local restockInterval, restockThreshold = 0.8, 2
+local cachedRemote, slotMemory = nil, {}
 
--- preset opsional sebelum skrip dijalankan:
--- getgenv().AutoRestockConfig = { interval = 15, movePlayer = false }
-local preset = getgenv().AutoRestockConfig
-if type(preset) == "table" then
-	for k, v in pairs(preset) do
-		if CFG[k] ~= nil then
-			CFG[k] = v
+-- State Loot
+local autoLoot = false
+local lootDelay = 0.8 
+local selectedLootItem = "Semua"
+local selectedMoveMethod = "Teleport (Cepat)"
+local tweenSpeed = 25 
+
+--------------------------------------------------------------------------------
+-- SISTEM DRAG & DROP UI
+--------------------------------------------------------------------------------
+local function makeDraggable(guiObject)
+	local dragging, dragInput, dragStart, startPos
+	guiObject.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, guiObject.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
 		end
-	end
-end
-
-local UI = nil
-
--- ===================== STATE =====================
-local State = {
-	running   = false,
-	items     = {},   -- ItemId -> {id, name, count, on}
-	order     = {},   -- urutan tampilan
-	log       = {},
-	cycles    = 0,
-	placed    = 0,
-	kiosName  = nil,
-}
-
--- ===================== UTILITAS =====================
-local function log(msg)
-	table.insert(State.log, msg)
-	while #State.log > CFG.maxLog do
-		table.remove(State.log, 1)
-	end
-	if UI and UI.refreshLog then
-		UI.refreshLog()
-	end
-end
-
-local function getKios()
-	local aktif = workspace:FindFirstChild("KiosAktif")
-	if not aktif then
-		return nil
-	end
-	return aktif:FindFirstChild("Kios_" .. player.Name)
-end
-
-local function slotList(kios)
-	local list = {}
-	for _, c in kios:GetChildren() do
-		local n = tonumber(string.match(c.Name, "^slot(%d+)$"))
-		if n then
-			list[#list + 1] = { name = c.Name, index = n, inst = c }
+	end)
+	guiObject.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - dragStart
+			TweenService:Create(guiObject, TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+			}):Play()
 		end
-	end
-	table.sort(list, function(a, b) return a.index < b.index end)
-	return list
+	end)
 end
 
--- baca kondisi satu slot
-local function readSlot(slot)
-	local info = {
-		prompt = slot:FindFirstChild("RakPrompt"),
-		stok   = slot:FindFirstChild("Stok"),
-		item   = nil,
-		count  = 0,
-		action = "",
-	}
-	if not info.prompt or not info.stok then
-		return nil
-	end
-	for _, v in info.stok:GetChildren() do
-		if v:IsA("ValueBase") then
-			info.item  = v.Name
-			info.count = v.Value or 0
-			break
-		end
-	end
-	local rak = slot.StokDisplay and slot.StokDisplay:FindFirstChild("Rak")
-	local untuk = rak and rak:GetAttribute("RakUntuk")
-	if info.item == nil and type(untuk) == "string" and untuk ~= "SlotKosong" then
-		info.item = untuk
-	end
-	-- sisa 0 atau sudah ditandai SlotKosong = dianggap kosong, supaya bisa diisi
-	-- ulang dengan bahan lain
-	if info.count <= 0 or untuk == "SlotKosong" then
-		info.item = nil
-		info.count = 0
-	end
-	info.action = info.prompt.ActionText or ""
-	return info
-end
-
--- cari tumpukan bahan di tas / tangan
-local function findStack(id)
-	for _, container in ipairs({ player.Backpack, player.Character }) do
-		if container then
-			for _, it in ipairs(container:GetChildren()) do
-				if it:IsA("Tool") and it:GetAttribute("ItemId") == id then
-					return it
-				end
-			end
-		end
+--------------------------------------------------------------------------------
+-- FUNGSI BANTUAN DATA
+--------------------------------------------------------------------------------
+local function getRakAksiRemote()
+	if cachedRemote then return cachedRemote end
+	for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+		if obj:IsA("RemoteFunction") and obj.Name == "RakAksi" then cachedRemote = obj return obj end
 	end
 	return nil
 end
 
-local function unequip()
-	local char = player.Character
-	if char then
-		local hum = char:FindFirstChildOfClass("Humanoid")
-		if hum then
-			hum:UnequipTools()
-		end
-	end
-end
-
-local function holdItem(tool)
-	local char = player.Character
-	if not char or not tool then
-		return false
-	end
-	if tool.Parent ~= char then
-		tool.Parent = char
-	end
-	local hum = char:FindFirstChildOfClass("Humanoid")
-	if hum then
-		hum:EquipTool(tool)
-	end
-	return true
-end
-
-local function moveTo(pos)
-	if not CFG.movePlayer then
-		return
-	end
-	local char = player.Character
-	local hrp = char and char:FindFirstChild("HumanoidRootPart")
-	if hrp and pos then
-		hrp.CFrame = CFrame.new(pos + Vector3.new(0, 2, 3))
-	end
-end
-
--- ===================== DAFTAR BAHAN =====================
-local function scanMaterials()
-	local found = {}
-	local order = {}
-	-- HARUS ikut memindai Character juga: saat bahan dipegang, tool-nya pindah
-	-- dari Backpack ke Character, dan kalau tidak dipindai daftar bahan akan
-	-- ikut hilang sehingga slot kosong tidak pernah diisi.
-	local function tally(container)
-		if not container then
-			return
-		end
-		for _, it in ipairs(container:GetChildren()) do
-			local id = it:GetAttribute("ItemId")
-			if it:IsA("Tool") and id and it:GetAttribute("PusakaItem") ~= true and it:GetAttribute("GaibItem") ~= true then
-				if not found[id] then
-					-- jangan hilangkan centangan yang sudah diganti user
-					local lama = State.items[id]
-					found[id] = {
-						id = id,
-						name = it:GetAttribute("LokSumber") or it.Name,
-						count = 0,
-						on = lama and lama.on or true,
-						skip = lama and lama.skip or false,
-					}
-					order[#order + 1] = id
-					State.items[id] = found[id]
-				end
-				found[id].count = (found[id].count or 0) + (it:GetAttribute("Count") or 1)
-			end
-		end
-	end
-	tally(player.Backpack)
-	tally(player.Character)
-	State.order = order
-	return order
-end
-
-local function enabledItems()
-	local list = {}
-	for _, id in ipairs(State.order) do
-		local it = State.items[id]
-		if it and it.on then
-			list[#list + 1] = id
-		end
-	end
-	return list
-end
-
--- ===================== LOGIKA RESTOCK =====================
--- Pilih bahan untuk slot kosong. Kumar urut: bahan yang belum dipakai slot lain,
--- lalu bahan yang memang tidak bisa dipakai slot lain, lalu bahan yang tadi
--- sudah dicoba dan ditolak rak (biar siklus ini tidak mengulang percobaan sia-sia).
-local function pickForEmpty(used, rejected)
-	local allowed = enabledItems()
-	for _, id in ipairs(allowed) do
-		if not used[id] and findStack(id) and not rejected[id] then
-			return id
-		end
-	end
-	for _, id in ipairs(allowed) do
-		if findStack(id) and not rejected[id] then
-			return id
-		end
-	end
-	for _, id in ipairs(allowed) do
-		if findStack(id) then
-			return id
-		end
+local function getMyKios()
+	local folder = Workspace:FindFirstChild("KiosAktif") or Workspace:FindFirstChild("Kios")
+	if not folder then return nil end
+	for _, m in ipairs(folder:GetChildren()) do
+		if m:IsA("Model") and m:GetAttribute("OwnerUserId") == LocalPlayer.UserId then return m end
 	end
 	return nil
 end
 
--- Aksi pada satu slot. Return: "isi" | "topup" | "penuh" | "gagal" | "lewati"
-local function actOnSlot(slot, info, used, rejected)
-	local wantId, kind
-
-	if info.item == nil then
-		-- slot kosong: pakai bahan pertama yang dicentang dan ada di tas
-		if not CFG.fillEmpty then
-			return "lewati"
-		end
-		wantId = pickForEmpty(used, rejected)
-		kind = "isi"
-		if not wantId then
-			return "lewati"
-		end
-	else
-		-- slot sudah berisi: top up dengan bahan yang sama
-		if not CFG.topUp then
-			return "lewati"
-		end
-		used[info.item] = true
-		wantId, kind = info.item, "topup"
+local function getKiosSlots()
+	local kios = getMyKios()
+	if not kios then return {} end
+	local slots = {}
+	for _, att in ipairs(kios:GetDescendants()) do
+		if att:IsA("Attachment") and att.Name:match("^slot%d+$") then table.insert(slots, att) end
 	end
-
-	local stack = findStack(wantId)
-	if not stack then
-		return "lewati"
-	end
-
-	moveTo(slot.WorldPosition)
-	task.wait(CFG.settle)
-	-- jarumumu bisa bergeser karena physics, ambil ulang posisi
-	moveTo(slot.WorldPosition)
-	if not holdItem(stack) then
-		return "gagal"
-	end
-	task.wait(0.1)
-
-	if not firePrompt then
-		log("fireproximityprompt tidak tersedia")
-		return "gagal"
-	end
-
-	local before = info.count
-	pcall(firePrompt, info.prompt)
-	task.wait(CFG.actionWait)
-
-	local after = readSlot(slot)
-	if after and after.item ~= nil and after.count > before then
-		State.placed += 1
-		used[after.item] = true
-		log(string.format("%s %s +%d", kind == "isi" and "Isi" or "Top up",
-			after.item, after.count - before))
-		return kind
-	end
-	if after and after.item ~= nil and after.count == before then
-		return "penuh"
-	end
-	-- ditolak rak (bahan mentah yang harus diolah dulu, atau sloting penuh)
-	rejected[wantId] = true
-	return "gagal"
+	table.sort(slots, function(a, b) return (tonumber(a.Name:match("%d+$")) or 0) < (tonumber(b.Name:match("%d+$")) or 0) end)
+	return slots
 end
 
-local function runCycle()
-	local kios = getKios()
-	if not kios then
-		log("Kios tidak ditemukan")
-		return
-	end
-	State.cycles += 1
-	local slots = slotList(kios)
-	local used = {}
-	local rejected = {}
-	local done = { isi = 0, topup = 0, penuh = 0, lewati = 0, gagal = 0 }
-	for _, s in ipairs(slots) do
-		local info = readSlot(s.inst)
-		if info then
-			local r = actOnSlot(s.inst, info, used, rejected)
-			done[r] = (done[r] or 0) + 1
-		end
-	end
-	unequip()
-	State.kiosName = kios.Name
-	if UI and UI.refreshStatus then
-		UI.refreshStatus(slots)
-	end
-	local ditolak = {}
-	for id in pairs(rejected) do
-		ditolak[#ditolak+1] = id
-	end
-	table.sort(ditolak)
-	log(string.format("Siklus #%d - isi %d, top up %d, penuh %d, gagal %d, lewati %d%s",
-		State.cycles, done.isi or 0, done.topup or 0, done.penuh or 0, done.gagal or 0, done.lewati or 0,
-		#ditolak > 0 and (" (ditolak: " .. table.concat(ditolak, ", ") .. ")") or ""))
-end
-
-local function mainLoop()
-	while State.running do
-		local ok, err = pcall(runCycle)
-		if not ok then
-			log("Error: " .. tostring(err))
-		end
-		if State.running then
-			for _ = 1, math.floor(CFG.interval * 20) do
-				if not State.running then
-					break
-				end
-				task.wait(0.05)
+local function getBackpackItems()
+	local bp = LocalPlayer:FindFirstChildOfClass("Backpack")
+	local items, seen = {}, {}
+	if bp then
+		for _, t in ipairs(bp:GetChildren()) do
+			if t:IsA("Tool") then
+				local id = t:GetAttribute("ItemId") or t.Name
+				if type(id) == "string" and id ~= "" and not seen[id] then seen[id] = true table.insert(items, id) end
 			end
 		end
 	end
+	return items
 end
 
-local function start()
-	if State.running or not firePrompt then
-		if not firePrompt then
-			log("Executor tidak punya fireproximityprompt")
-		end
-		return
-	end
-	State.running = true
-	log("Auto restock aktif")
-	task.spawn(mainLoop)
-end
-
-local function stop()
-	State.running = false
-	log("Auto restock dihentikan")
-	unequip()
-end
-
--- ===================== UI =====================
-local COL = {
-	bg     = Color3.fromRGB(24, 26, 32),
-	panel  = Color3.fromRGB(33, 36, 44),
-	stroke = Color3.fromRGB(64, 70, 84),
-	text   = Color3.fromRGB(233, 236, 242),
-	dim    = Color3.fromRGB(150, 157, 172),
-	accent = Color3.fromRGB(78, 196, 140),
-	warn   = Color3.fromRGB(232, 168, 72),
-	bad    = Color3.fromRGB(226, 90, 90),
-}
-
-local function make(class, parent, props)
-	local o = Instance.new(class)
-	o.Name = props.Name or class
-	for k, v in pairs(props) do
-		if k ~= "Name" and k ~= "Parent" then
-			pcall(function() o[k] = v end)
+local function getAvailableLootItems()
+	local items = {"Semua"}
+	local seen = {}
+	local spawnBahan = Workspace:FindFirstChild("SpawnBahan")
+	if spawnBahan then
+		for _, obj in ipairs(spawnBahan:GetChildren()) do
+			local name = obj.Name
+			if not seen[name] and name ~= "Part" and name ~= "Model" then
+				seen[name] = true
+				table.insert(items, name)
+			end
 		end
 	end
-	if parent then
-		o.Parent = parent
-	end
-	return o
+	return items
 end
 
-local function corner(o, r)
-	make("UICorner", o, { CornerRadius = UDim.new(0, r or 8) })
-end
-
-local function label(parent, text, size, pos, size2, color)
-	return make("TextLabel", parent, {
-		BackgroundTransparency = 1,
-		Text = text,
-		TextSize = size or 13,
-		TextColor3 = color or COL.text,
-		Font = Enum.Font.GothamMedium,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		Position = pos,
-		Size = size2,
-	})
-end
-
-local function buildUI()
-	if UI then
-		UI.gui:Destroy()
-	end
-
-	local gui = make("ScreenGui", PlayerGui, {
-		Name = "AutoRestockUi",
-		ResetOnSpawn = false,
-		IgnoreGuiInset = false,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	})
-	UI = { gui = gui }
-
-	local frame = make("Frame", gui, {
-		BackgroundColor3 = COL.bg,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0, 18, 0.5, -230),
-		Size = UDim2.fromOffset(330, 460),
-	})
-	corner(frame, 12)
-	make("UIStroke", frame, { Color = COL.stroke, Thickness = 1 })
-	UI.frame = frame
-
-	-- header
-	local head = make("Frame", frame, {
-		BackgroundColor3 = COL.panel,
-		BorderSizePixel = 0,
-		Size = UDim2.new(1, 0, 0, 40),
-	})
-	corner(head, 12)
-	make("Frame", head, {
-		BackgroundColor3 = COL.panel,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0, 0, 1, -12),
-		Size = UDim2.new(1, 0, 0, 12),
-	})
-	local titleLbl = label(head, "Auto Restock Rak", 15, UDim2.fromOffset(14, 11), UDim2.new(1, -70, 0, 20))
-
-	-- tombol bulat (UICorner Radius 1,0 pada kotak = lingkaran sempurna)
-	local function roundButton(text, xOffset, size, bg)
-		local b = make("TextButton", head, {
-			BackgroundColor3 = bg or COL.bg,
-			Text = text,
-			TextSize = 14,
-			TextColor3 = COL.text,
-			Font = Enum.Font.GothamBold,
-			Position = UDim2.new(1, xOffset, 0, 7),
-			Size = UDim2.fromOffset(size, size),
-			AutoButtonColor = false,
-		})
-		corner(b, math.floor(size / 2))
-		make("UIStroke", b, { Color = COL.stroke, Thickness = 1 })
-		return b
-	end
-
-	local minBtn = roundButton("-", -62, 26)
-	local closeBtn = roundButton("X", -32, 26)
-	closeBtn.TextSize = 11
-	closeBtn.TextColor3 = COL.dim
-	closeBtn.MouseButton1Click:Connect(function()
-		gui:Destroy()
-		UI = nil
-	end)
-
-	local body = make("Frame", frame, {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(0, 44),
-		Size = UDim2.new(1, -20, 1, -56),
-	})
-	UI.body = body
-
-	-- status
-	local status = label(body, "Menyiapkan...", 12, UDim2.fromOffset(6, 2), UDim2.new(1, -12, 0, 32), COL.dim)
-	status.TextWrapped = true
-	status.TextYAlignment = Enum.TextYAlignment.Top
-	UI.status = status
-
-	-- interval
-	local row1 = make("Frame", body, {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(6, 38),
-		Size = UDim2.new(1, -12, 0, 28),
-	})
-	label(row1, "Interval", 12, UDim2.fromOffset(0, 5), UDim2.fromOffset(56, 18), COL.dim)
-	local minus = make("TextButton", row1, {
-		BackgroundColor3 = COL.panel,
-		Text = "-",
-		TextSize = 15,
-		TextColor3 = COL.text,
-		Font = Enum.Font.GothamBold,
-		Position = UDim2.fromOffset(60, 0),
-		Size = UDim2.fromOffset(26, 26),
-	})
-	corner(minus, 6)
-	local intervalLbl = label(row1, CFG.interval .. "s", 13, UDim2.fromOffset(92, 5), UDim2.fromOffset(44, 18))
-	intervalLbl.TextXAlignment = Enum.TextXAlignment.Center
-	local plus = make("TextButton", row1, {
-		BackgroundColor3 = COL.panel,
-		Text = "+",
-		TextSize = 15,
-		TextColor3 = COL.text,
-		Font = Enum.Font.GothamBold,
-		Position = UDim2.fromOffset(142, 0),
-		Size = UDim2.fromOffset(26, 26),
-	})
-	corner(plus, 6)
-	minus.MouseButton1Click:Connect(function()
-		CFG.interval = math.max(3, CFG.interval - 1)
-		intervalLbl.Text = CFG.interval .. "s"
-	end)
-	plus.MouseButton1Click:Connect(function()
-		CFG.interval = math.min(120, CFG.interval + 1)
-		intervalLbl.Text = CFG.interval .. "s"
-	end)
-
-	-- toggle options
-	local function option(y, text, initial, onChange)
-		local holder = make("Frame", body, {
-			BackgroundTransparency = 1,
-			Position = UDim2.fromOffset(6, y),
-			Size = UDim2.new(1, -12, 0, 24),
-		})
-		local box = make("TextButton", holder, {
-			BackgroundColor3 = initial and COL.accent or COL.panel,
-			Text = initial and "v" or "",
-			TextSize = 12,
-			TextColor3 = Color3.fromRGB(18, 20, 24),
-			Font = Enum.Font.GothamBold,
-			Position = UDim2.fromOffset(0, 1),
-			Size = UDim2.fromOffset(20, 20),
-		})
-		corner(box, 5)
-		make("UIStroke", box, { Color = COL.stroke, Thickness = 1 })
-		label(holder, text, 12, UDim2.fromOffset(28, 3), UDim2.new(1, -28, 0, 18), COL.text)
-		local state = { on = initial }
-		box.MouseButton1Click:Connect(function()
-			state.on = not state.on
-			box.Text = state.on and "v" or ""
-			box.BackgroundColor3 = state.on and COL.accent or COL.panel
-			onChange(state.on)
-		end)
-		return box
-	end
-
-	option(70, "Isi slot kosong", CFG.fillEmpty, function(v) CFG.fillEmpty = v end)
-	option(94, "Top up slot terisi", CFG.topUp, function(v) CFG.topUp = v end)
-	option(118, "Pindahkan karakter ke slot", CFG.movePlayer, function(v) CFG.movePlayer = v end)
-
-	-- daftar bahan
-	local listTitle = label(body, "Bahan dipakai (klik untuk centang)", 11, UDim2.fromOffset(6, 146), UDim2.new(1, -12, 0, 16), COL.dim)
-	UI.listTitle = listTitle
-
-	local list = make("ScrollingFrame", body, {
-		BackgroundColor3 = COL.panel,
-		BorderSizePixel = 0,
-		Position = UDim2.fromOffset(6, 164),
-		Size = UDim2.new(1, -12, 0, 128),
-		ScrollBarThickness = 4,
-		ScrollBarImageColor3 = COL.stroke,
-		CanvasSize = UDim2.new(),
-		AutomaticCanvasSize = Enum.AutomaticSize.Y,
-	})
-	corner(list, 8)
-	make("UIListLayout", list, {
-		Padding = UDim.new(0, 3),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	})
-	make("UIPadding", list, {
-		PaddingTop = UDim.new(0, 4),
-		PaddingBottom = UDim.new(0, 4),
-		PaddingLeft = UDim.new(0, 4),
-		PaddingRight = UDim.new(0, 4),
-	})
-	UI.list = list
-
-	-- log
-	local logFrame = make("Frame", body, {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(6, 298),
-		Size = UDim2.new(1, -12, 0, 74),
-	})
-	UI.logFrame = logFrame
-
-	-- tombol utama
-	local toggle = make("TextButton", body, {
-		BackgroundColor3 = COL.accent,
-		Text = "MULAI",
-		TextSize = 15,
-		TextColor3 = Color3.fromRGB(16, 20, 18),
-		Font = Enum.Font.GothamBold,
-		Position = UDim2.fromOffset(6, 378),
-		Size = UDim2.new(1, -12, 0, 36),
-	})
-	corner(toggle, 8)
-	toggle.MouseButton1Click:Connect(function()
-		if State.running then
-			stop()
-			toggle.Text = "MULAI"
-			toggle.BackgroundColor3 = COL.accent
-		else
-			start()
-			toggle.Text = "BERHENTI"
-			toggle.BackgroundColor3 = COL.bad
+-- FUNGSI BARU: Cek apakah ada bagian dari barang yang terlihat (bukan sekadar hitbox transparan)
+local function isItemVisible(itemModel)
+	if itemModel:IsA("BasePart") and itemModel.Transparency < 1 then return true end
+	for _, child in ipairs(itemModel:GetDescendants()) do
+		if child:IsA("BasePart") and child.Transparency < 1 then
+			return true
 		end
-	end)
-	UI.toggle = toggle
+	end
+	return false
+end
 
-	-- refresh daftar bahan (baris diperbarui, bukan dibuat ulang, supaya
-	-- centangan dan posisi scroll tidak hilang tiap beberapa detik)
-	UI.rows = {}
-	UI.refreshList = function()
-		scanMaterials()
-		local seen = {}
-		for i, id in ipairs(State.order) do
-			seen[id] = true
-			local row = UI.rows[id]
-			if not row then
-				local btn = make("TextButton", list, {
-					BackgroundColor3 = COL.bg,
-					Text = "",
-					LayoutOrder = i,
-					Size = UDim2.new(1, -4, 0, 24),
-					AutoButtonColor = true,
-				})
-				corner(btn, 6)
-				local mark = label(btn, "", 12, UDim2.fromOffset(8, 4), UDim2.fromOffset(16, 16), COL.dim)
-				local nm = label(btn, "", 12, UDim2.fromOffset(28, 4), UDim2.new(1, -110, 0, 16))
-				local ct = label(btn, "0", 11, UDim2.new(1, -74, 0, 5), UDim2.fromOffset(66, 16), COL.dim)
-				ct.TextXAlignment = Enum.TextXAlignment.Right
-				btn.MouseButton1Click:Connect(function()
-					-- baca state terbaru, bukan Closure lama
-					local cur = State.items[id]
-					if not cur then
-						return
-					end
-					cur.on = not cur.on
-					mark.Text = cur.on and "v" or "-"
-					mark.TextColor3 = cur.on and COL.accent or COL.dim
+--------------------------------------------------------------------------------
+-- UI BUILDER 
+--------------------------------------------------------------------------------
+if PlayerGui:FindFirstChild("WindUI_Sidebar") then PlayerGui.WindUI_Sidebar:Destroy() end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "WindUI_Sidebar"
+gui.ResetOnSpawn = false
+gui.Parent = PlayerGui
+
+local floatIcon = Instance.new("TextButton")
+floatIcon.Size, floatIcon.Position = UDim2.new(0, 48, 0, 48), UDim2.new(0.05, 0, 0.4, 0)
+floatIcon.BackgroundColor3, floatIcon.Text = Color3.fromRGB(30, 30, 46), "⚡"
+floatIcon.TextSize, floatIcon.Visible = 20, false
+floatIcon.Parent = gui
+Instance.new("UICorner", floatIcon).CornerRadius = UDim.new(1, 0)
+Instance.new("UIStroke", floatIcon).Color = Color3.fromRGB(137, 180, 250)
+makeDraggable(floatIcon)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size, mainFrame.Position = UDim2.new(0, 500, 0, 400), UDim2.new(0.05, 0, 0.2, 0)
+mainFrame.BackgroundColor3, mainFrame.ClipsDescendants = Color3.fromRGB(17, 17, 27), true
+mainFrame.Parent = gui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+Instance.new("UIStroke", mainFrame).Color = Color3.fromRGB(49, 50, 68)
+makeDraggable(mainFrame)
+
+local topbar = Instance.new("Frame")
+topbar.Size, topbar.BackgroundColor3 = UDim2.new(1, 0, 0, 36), Color3.fromRGB(24, 24, 37)
+topbar.Parent = mainFrame
+local title = Instance.new("TextLabel")
+title.Size, title.Position = UDim2.new(1, -70, 1, 0), UDim2.new(0, 16, 0, 0)
+title.BackgroundTransparency, title.Text = 1, "WindUI Hub V15"
+title.TextColor3, title.Font, title.TextSize = Color3.fromRGB(205, 214, 244), Enum.Font.GothamBold, 12
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = topbar
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size, minBtn.Position = UDim2.new(0, 24, 0, 24), UDim2.new(1, -58, 0.5, -12)
+minBtn.BackgroundColor3, minBtn.Text, minBtn.TextColor3 = Color3.fromRGB(49, 50, 68), "–", Color3.fromRGB(255, 255, 255)
+minBtn.Parent = topbar
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size, closeBtn.Position = UDim2.new(0, 24, 0, 24), UDim2.new(1, -30, 0.5, -12)
+closeBtn.BackgroundColor3, closeBtn.Text, closeBtn.TextColor3 = Color3.fromRGB(243, 139, 168), "✕", Color3.fromRGB(17, 17, 27)
+closeBtn.Parent = topbar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+minBtn.Activated:Connect(function()
+	mainFrame.Visible = false
+	floatIcon.Visible, floatIcon.Size = true, UDim2.new(0, 0, 0, 0)
+	TweenService:Create(floatIcon, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {Size = UDim2.new(0, 48, 0, 48)}):Play()
+end)
+floatIcon.Activated:Connect(function()
+	floatIcon.Visible, mainFrame.Visible = false, true
+end)
+closeBtn.Activated:Connect(function() gui:Destroy() end)
+
+local sidebar = Instance.new("Frame")
+sidebar.Size, sidebar.Position = UDim2.new(0, 120, 1, -36), UDim2.new(0, 0, 0, 36)
+sidebar.BackgroundColor3 = Color3.fromRGB(24, 24, 37)
+sidebar.Parent = mainFrame
+local sbLayout = Instance.new("UIListLayout")
+sbLayout.Padding, sbLayout.HorizontalAlignment = UDim.new(0, 5), Enum.HorizontalAlignment.Center
+sbLayout.Parent = sidebar
+Instance.new("UIPadding", sidebar).PaddingTop = UDim.new(0, 10)
+
+local contentArea = Instance.new("Frame")
+contentArea.Size, contentArea.Position = UDim2.new(1, -120, 1, -36), UDim2.new(0, 120, 0, 36)
+contentArea.BackgroundTransparency = 1
+contentArea.Parent = mainFrame
+
+local pages = {}
+local function createTab(name, icon, isDefault)
+	local btn = Instance.new("TextButton")
+	btn.Size, btn.BackgroundColor3 = UDim2.new(0.9, 0, 0, 32), isDefault and Color3.fromRGB(49, 50, 68) or Color3.fromRGB(30, 30, 46)
+	btn.Text, btn.TextColor3 = " " .. icon .. " " .. name, Color3.fromRGB(205, 214, 244)
+	btn.Font, btn.TextSize, btn.TextXAlignment = Enum.Font.GothamMedium, 11, Enum.TextXAlignment.Left
+	btn.Parent = sidebar
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+	local page = Instance.new("ScrollingFrame")
+	page.Size, page.Position = UDim2.new(1, -20, 1, -20), UDim2.new(0, 10, 0, 10)
+	page.BackgroundTransparency = 1
+	page.ScrollBarThickness = 2
+	page.Visible = isDefault
+	page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	page.CanvasSize = UDim2.new(0,0,0,0)
+	page.Parent = contentArea
+	Instance.new("UIListLayout", page).Padding = UDim.new(0, 8)
+	
+	table.insert(pages, {btn = btn, page = page})
+	
+	btn.Activated:Connect(function()
+		for _, p in ipairs(pages) do 
+			p.btn.BackgroundColor3 = Color3.fromRGB(30, 30, 46)
+			p.page.Visible = false 
+		end
+		btn.BackgroundColor3 = Color3.fromRGB(49, 50, 68)
+		page.Visible = true
+	end)
+	
+	return page
+end
+
+local pageRestock = createTab("Restock", "🛒", true)
+local pageLoot = createTab("Looting", "🎁", false)
+
+-- HELPER UI
+local function createDropdown(parent, titleText, initialVal, getOptionsFunc, onSelect)
+	local frame = Instance.new("Frame")
+	frame.Size, frame.BackgroundTransparency = UDim2.new(1, 0, 0, 45), 1
+	frame.Parent = parent
+
+	local lbl = Instance.new("TextLabel")
+	lbl.Size, lbl.BackgroundTransparency = UDim2.new(1, 0, 0, 14), 1
+	lbl.Text, lbl.TextColor3, lbl.Font, lbl.TextSize = "  " .. titleText, Color3.fromRGB(186, 194, 222), Enum.Font.GothamMedium, 10
+	lbl.TextXAlignment, lbl.Parent = Enum.TextXAlignment.Left, frame
+
+	local btn = Instance.new("TextButton")
+	btn.Size, btn.Position = UDim2.new(1, 0, 0, 26), UDim2.new(0, 0, 0, 18)
+	btn.BackgroundColor3, btn.Text = Color3.fromRGB(30, 30, 46), "   " .. initialVal .. "  ▼"
+	btn.TextColor3, btn.Font, btn.TextSize = Color3.fromRGB(205, 214, 244), Enum.Font.Gotham, 11
+	btn.TextXAlignment, btn.ZIndex = Enum.TextXAlignment.Left, 10
+	btn.Parent = frame
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+	local scrollList = Instance.new("ScrollingFrame")
+	scrollList.Size, scrollList.Position = UDim2.new(1, 0, 0, 0), UDim2.new(0, 0, 1, 2)
+	scrollList.BackgroundColor3, scrollList.Visible, scrollList.ZIndex = Color3.fromRGB(24, 24, 37), false, 20
+	scrollList.ScrollBarThickness = 2
+	scrollList.Parent = btn
+	Instance.new("UICorner", scrollList).CornerRadius = UDim.new(0, 6)
+	Instance.new("UIListLayout", scrollList)
+
+	btn.Activated:Connect(function()
+		scrollList.Visible = not scrollList.Visible
+		if scrollList.Visible then
+			for _, c in ipairs(scrollList:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+			
+			local opts = type(getOptionsFunc) == "function" and getOptionsFunc() or getOptionsFunc
+			if #opts == 0 then opts = {"Menunggu data..."} end
+			
+			for _, opt in ipairs(opts) do
+				local optBtn = Instance.new("TextButton")
+				optBtn.Size, optBtn.BackgroundColor3 = UDim2.new(1, 0, 0, 26), Color3.fromRGB(24, 24, 37)
+				optBtn.Text, optBtn.TextColor3 = "   " .. opt, Color3.fromRGB(205, 214, 244)
+				optBtn.Font, optBtn.TextSize, optBtn.TextXAlignment = Enum.Font.Gotham, 11, Enum.TextXAlignment.Left
+				optBtn.ZIndex = 21
+				optBtn.Parent = scrollList
+				optBtn.Activated:Connect(function()
+					btn.Text = "   " .. opt .. "  ▼"
+					scrollList.Visible = false
+					frame.Size = UDim2.new(1, 0, 0, 45)
+					onSelect(opt)
 				end)
-				row = { frame = btn, mark = mark, name = nm, count = ct }
-				UI.rows[id] = row
 			end
-			local item = State.items[id]
-			row.frame.LayoutOrder = i
-			row.name.Text = item.name
-			row.count.Text = tostring(item.count)
-			row.mark.Text = item.on and "v" or "-"
-			row.mark.TextColor3 = item.on and COL.accent or COL.dim
+			
+			local listHeight = math.min(#opts * 26, 100)
+			scrollList.Size = UDim2.new(1, 0, 0, listHeight)
+			scrollList.CanvasSize = UDim2.new(0, 0, 0, #opts * 26)
+			frame.Size = UDim2.new(1, 0, 0, 45 + listHeight) 
+		else
+			frame.Size = UDim2.new(1, 0, 0, 45)
 		end
-		for id, row in pairs(UI.rows) do
-			if not seen[id] then
-				row.frame:Destroy()
-				UI.rows[id] = nil
+	end)
+end
+
+local function createToggle(parent, text, onToggle)
+	local active = false
+	local btn = Instance.new("TextButton")
+	btn.Size, btn.BackgroundColor3 = UDim2.new(1, 0, 0, 30), Color3.fromRGB(30, 30, 46)
+	btn.Text, btn.TextColor3, btn.Font, btn.TextSize = "  " .. text, Color3.fromRGB(205, 214, 244), Enum.Font.GothamBold, 11
+	btn.TextXAlignment, btn.ZIndex = Enum.TextXAlignment.Left, 1
+	btn.Parent = parent
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+	
+	local ind = Instance.new("Frame")
+	ind.Size, ind.Position = UDim2.new(0, 10, 0, 10), UDim2.new(1, -20, 0.5, -5)
+	ind.BackgroundColor3 = Color3.fromRGB(243, 139, 168)
+	ind.Parent = btn
+	Instance.new("UICorner", ind).CornerRadius = UDim.new(1, 0)
+	
+	btn.Activated:Connect(function()
+		active = not active
+		ind.BackgroundColor3 = active and Color3.fromRGB(166, 227, 161) or Color3.fromRGB(243, 139, 168)
+		onToggle(active)
+	end)
+end
+
+--------------------------------------------------------------------------------
+-- ISI PAGE 1: RESTOCK
+--------------------------------------------------------------------------------
+createDropdown(pageRestock, "Pilih Slot", "slot1", function()
+	local names = {}
+	for _, s in ipairs(getKiosSlots()) do table.insert(names, s.Name) end
+	return #names > 0 and names or {"slot1"}
+end, function(val) selectedSlot = val end)
+
+createDropdown(pageRestock, "Pilih Item dari Tas", "Pilih...", getBackpackItems, function(val) selectedItem = val end)
+
+local actionGrid = Instance.new("Frame")
+actionGrid.Size, actionGrid.BackgroundTransparency = UDim2.new(1, 0, 0, 26), 1
+actionGrid.Parent = pageRestock
+local gridLayout = Instance.new("UIGridLayout", actionGrid)
+gridLayout.CellSize, gridLayout.CellPadding = UDim2.new(0.31, 0, 1, 0), UDim2.new(0.035, 0, 0, 0)
+
+local function sendAction(aksi, slot, param)
+	local remote = getRakAksiRemote()
+	if remote then pcall(function() remote:InvokeServer(aksi, slot, param) end) end
+end
+
+local function createBtn(text, color, callback)
+	local btn = Instance.new("TextButton")
+	btn.BackgroundColor3, btn.Text, btn.TextColor3 = color, text, Color3.fromRGB(17, 17, 27)
+	btn.Font, btn.TextSize, btn.Parent = Enum.Font.GothamBold, 11, actionGrid
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+	btn.Activated:Connect(callback)
+end
+
+createBtn("Taruh", Color3.fromRGB(137, 180, 250), function() if selectedSlot ~= "" and selectedItem ~= "" then sendAction("taruh", selectedSlot, selectedItem) end end)
+createBtn("Isi Manual", Color3.fromRGB(166, 227, 161), function() sendAction("isi", selectedSlot, nil) end)
+createBtn("Ambil", Color3.fromRGB(250, 179, 135), function() sendAction("ambil", selectedSlot, nil) end)
+
+createToggle(pageRestock, "⚡ Auto Restock Semua Rak", function(v) autoRestockAll = v end)
+createToggle(pageRestock, "🎯 Auto Restock Rak Terpilih", function(v) autoRestockSelected = v end)
+
+local restockStatus = Instance.new("TextLabel")
+restockStatus.Size, restockStatus.BackgroundColor3 = UDim2.new(1, 0, 0, 26), Color3.fromRGB(24, 24, 37)
+restockStatus.Text, restockStatus.TextColor3 = "Status: Idle", Color3.fromRGB(186, 194, 222)
+restockStatus.Font, restockStatus.TextSize = Enum.Font.Gotham, 11
+restockStatus.Parent = pageRestock
+Instance.new("UICorner", restockStatus).CornerRadius = UDim.new(0, 6)
+
+--------------------------------------------------------------------------------
+-- ISI PAGE 2: LOOTING
+--------------------------------------------------------------------------------
+createDropdown(pageLoot, "Target Bahan Loot", "Semua", getAvailableLootItems, function(val) selectedLootItem = val end)
+createDropdown(pageLoot, "Metode Jalan", "Teleport (Cepat)", {"Teleport (Cepat)", "Tween (Jalan/Terbang)"}, function(val) selectedMoveMethod = val end)
+createDropdown(pageLoot, "Kecepatan Collect (Tween Speed)", "25", {"15 (Aman)", "25 (Normal)", "50 (Cepat)", "100 (Flash)"}, function(val) 
+	tweenSpeed = tonumber(val:match("%d+")) or 25 
+end)
+
+createToggle(pageLoot, "🚀 Enable Auto Loot", function(v) autoLoot = v end)
+
+local lootStatus = Instance.new("TextLabel")
+lootStatus.Size, lootStatus.BackgroundColor3 = UDim2.new(1, 0, 0, 26), Color3.fromRGB(24, 24, 37)
+lootStatus.Text, lootStatus.TextColor3 = "Status: Idle", Color3.fromRGB(186, 194, 222)
+lootStatus.Font, lootStatus.TextSize = Enum.Font.Gotham, 11
+lootStatus.Parent = pageLoot
+Instance.new("UICorner", lootStatus).CornerRadius = UDim.new(0, 6)
+
+--------------------------------------------------------------------------------
+-- ENGINE RESTOCK 
+--------------------------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(restockInterval)
+		local remote = getRakAksiRemote()
+		local function processSlot(slotObj)
+			local sName = slotObj.Name
+			local item = slotObj:GetAttribute("Item") or slotObj:GetAttribute("ItemId")
+			if type(item) == "string" and item ~= "" then slotMemory[sName] = item else item = slotMemory[sName] end
+			if item then
+				local stock = slotObj:GetAttribute("Stok") or slotObj:GetAttribute("Jumlah") or 0
+				if type(stock) == "number" and stock <= restockThreshold then
+					restockStatus.Text = "Isi " .. sName .. " (" .. item .. ")"
+					pcall(function() remote:InvokeServer("isi", sName, nil) end)
+					if stock == 0 then
+						task.wait(0.1)
+						pcall(function() remote:InvokeServer("taruh", sName, item) end)
+					end
+					task.wait(0.2)
+				end
 			end
 		end
-		if #State.order == 0 then
-			if not UI.emptyNote then
-				UI.emptyNote = label(list, "Belum ada bahan di tas", 11, UDim2.fromOffset(4, 4), UDim2.new(1, -8, 0, 16), COL.dim)
+
+		if remote then
+			if autoRestockAll then
+				for _, slotObj in ipairs(getKiosSlots()) do processSlot(slotObj) end
+			elseif autoRestockSelected and selectedSlot ~= "" then
+				for _, slotObj in ipairs(getKiosSlots()) do
+					if slotObj.Name == selectedSlot then processSlot(slotObj) break end
+				end
 			end
-		elseif UI.emptyNote then
-			UI.emptyNote:Destroy()
-			UI.emptyNote = nil
 		end
 	end
+end)
 
-	UI.refreshLog = function()
-		for _, c in ipairs(logFrame:GetChildren()) do
-			c:Destroy()
-		end
-		for i, msg in ipairs(State.log) do
-			local color = COL.dim
-			if string.find(msg, "Isi") or string.find(msg, "Top up") then
-				color = COL.accent
-			elseif string.find(msg, "Error") or string.find(msg, "tidak") then
-				color = COL.bad
-			elseif string.find(msg, "aktif") then
-				color = COL.warn
-			end
-			label(logFrame, msg, 10, UDim2.fromOffset(2, i * 12), UDim2.new(1, -4, 0, 12), color)
-		end
-	end
+--------------------------------------------------------------------------------
+-- ENGINE AUTO LOOT (SMART VISIBILITY DETECTION)
+--------------------------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(lootDelay)
+		if autoLoot then
+			local spawnBahan = Workspace:FindFirstChild("SpawnBahan")
+			local char = LocalPlayer.Character
+			local hrp = char and char:FindFirstChild("HumanoidRootPart")
 
-	UI.refreshStatus = function(slots)
-		local filled, total, full = 0, 0, 0
-		if slots then
-			for _, s in ipairs(slots) do
-				local info = readSlot(s.inst)
-				if info then
-					total += 1
-					if info.item then
-						filled += 1
-						if string.find(info.action, "full") or string.find(info.action, "penuh") then
-							full += 1
+			if spawnBahan and hrp then
+				for _, item in ipairs(spawnBahan:GetChildren()) do
+					if not autoLoot then break end 
+					
+					if selectedLootItem == "Semua" or item.Name:match(selectedLootItem) then
+						local prompt = item:FindFirstChildWhichIsA("ProximityPrompt", true)
+						
+						if prompt and prompt.Parent and prompt.Parent:IsA("BasePart") then
+							
+							-- FIX: Cek apakah prompt Enable DAN visual itemnya beneran kelihatan di map
+							if prompt.Enabled and isItemVisible(item) then
+								
+								pcall(function() prompt.RequiresLineOfSight = false end)
+
+								local targetCFrame = prompt.Parent.CFrame
+								local targetPos = targetCFrame.Position
+								lootStatus.Text = "Menuju: " .. item.Name
+								
+								if selectedMoveMethod == "Teleport (Cepat)" then
+									hrp.CFrame = targetCFrame
+									hrp.Velocity = Vector3.new(0,0,0) 
+									task.wait(0.5) 
+									
+								elseif selectedMoveMethod == "Tween (Jalan/Terbang)" then
+									local dist = (hrp.Position - targetPos).Magnitude
+									local duration = dist / tweenSpeed
+									local tween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+									tween:Play()
+									tween.Completed:Wait()
+									hrp.Velocity = Vector3.new(0,0,0)
+									task.wait(0.3)
+								end
+								
+								lootStatus.Text = "Mengambil: " .. item.Name
+								
+								pcall(function()
+									prompt:InputHoldBegin()
+									task.wait(prompt.HoldDuration + 0.15)
+									prompt:InputHoldEnd()
+								end)
+								
+								task.wait(0.5)
+							end
 						end
 					end
 				end
+				lootStatus.Text = "Status: Menunggu " .. selectedLootItem .. " spawn..."
 			end
-		end
-		status.Text = string.format(
-			"%s\nSlot terisi %d/%d (penuh %d)  |  siklus %d  |  total masuk %d",
-			State.kiosName or "Kios tidak ditemukan", filled, total, full, State.cycles, State.placed)
-	end
-
-	-- seret window
-	local dragging, dragStart, startPos
-	head.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or
-			input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			startPos = frame.Position
-		end
-	end)
-	frame.InputChanged:Connect(function(input)
-		if dragging and (input.UserInputType == Enum.UserInputType.Movement or
-			input.UserInputType == Enum.UserInputType.Touch) then
-			local delta = input.Position - dragStart
-			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
-				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-		end
-	end)
-	frame.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or
-			input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end)
-
-	minBtn.MouseButton1Click:Connect(function()
-		local minimized = not body.Visible
-		body.Visible = minimized
-		titleLbl.Visible = minimized
-		frame.Size = minimized and UDim2.fromOffset(330, 40) or UDim2.fromOffset(330, 460)
-		minBtn.Text = minimized and "+" or "-"
-	end)
-end
-
--- ===================== BOOTSTRAP =====================
-buildUI()
-scanMaterials()
-UI.refreshList()
-UI.refreshLog()
-UI.refreshStatus(nil)
-
-if not firePrompt then
-	log("Executor tidak punya fireproximityprompt")
-else
-	log("Siap. Klik MULAI untuk mengisi rak.")
-end
-
-if getgenv().AutoRestockAutoStart then
-	start()
-end
-
--- ===================== KONTROL DARI LUAR =====================
--- Contoh: getgenv().AutoRestock.start()  /  .stop()  /  .state
-getgenv().AutoRestock = {
-	start  = start,
-	stop   = stop,
-	state  = State,
-	cfg    = CFG,
-	kios   = getKios,
-	slots  = function()
-		local kios = getKios()
-		return kios and slotList(kios) or {}
-	end,
-	cycle  = runCycle,
-	scan   = scanMaterials,
-	refresh = function()
-		if UI then
-			UI.refreshList()
-			UI.refreshStatus(nil)
-		end
-	end,
-}
-
--- segarkan daftar bahan tiap beberapa siklus
-task.spawn(function()
-	local tick = 0
-	while UI do
-		task.wait(3)
-		tick += 1
-		if tick >= CFG.refreshList and UI and UI.refreshList then
-			tick = 0
-			UI.refreshList()
 		end
 	end
 end)
